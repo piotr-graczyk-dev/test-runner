@@ -7,7 +7,7 @@ on:
         description: "ai-tester run ID"
         required: true
       artifact_url:
-        description: "EAS APK artifact URL"
+        description: "EAS artifact URL (.app tarball or .apk)"
         required: true
       flows_json:
         description: "Base64-encoded JSON array of {id, yaml}"
@@ -18,25 +18,14 @@ on:
 
 jobs:
   maestro:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
-      - uses: actions/setup-java@v4
-        with:
-          java-version: "17"
-          distribution: "temurin"
-
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
       - name: Install Maestro
         run: |
           curl -Ls "https://get.maestro.mobile.dev" | bash
           echo "$HOME/.maestro/bin" >> $GITHUB_PATH
 
-      - name: Prepare flows and download APK
+      - name: Prepare flows and download artifact
         env:
           FLOWS_JSON: ${{ inputs.flows_json }}
           ARTIFACT_URL: ${{ inputs.artifact_url }}
@@ -51,24 +40,44 @@ jobs:
             });
           "
           wget -q -O artifact "$ARTIFACT_URL"
-          # EAS artifacts may be a tar.gz containing the APK — extract if needed
-          if file artifact | grep -q "gzip"; then
+          # Detect format and extract
+          if file artifact | grep -q "gzip\|tar"; then
             tar -xzf artifact
-            APK=$(find . -name "*.apk" | head -1)
-            mv "$APK" app.apk
+            # Find .app bundle or .apk
+            APP=$(find . -name "*.app" -maxdepth 3 -type d | head -1)
+            APK=$(find . -name "*.apk" -maxdepth 3 | head -1)
+            if [ -n "$APP" ]; then
+              echo "Found iOS .app: $APP"
+              echo "PLATFORM=ios" >> $GITHUB_ENV
+              echo "APP_PATH=$APP" >> $GITHUB_ENV
+            elif [ -n "$APK" ]; then
+              echo "Found Android .apk: $APK"
+              echo "PLATFORM=android" >> $GITHUB_ENV
+              echo "APP_PATH=$APK" >> $GITHUB_ENV
+            else
+              echo "No .app or .apk found in archive" && exit 1
+            fi
           else
+            echo "PLATFORM=android" >> $GITHUB_ENV
             mv artifact app.apk
+            echo "APP_PATH=app.apk" >> $GITHUB_ENV
           fi
-          echo "APK ready: $(du -sh app.apk)"
 
-      - name: Run Maestro on Android emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 29
-          arch: x86_64
-          profile: pixel_5
-          script: |
-            $HOME/.maestro/bin/maestro test flows/ --format JUNIT --output /tmp/results.xml || true
+      - name: Boot iOS Simulator
+        if: env.PLATFORM == 'ios'
+        run: |
+          UDID=$(xcrun simctl list devices available | grep "iPhone 15" | head -1 | grep -o '[A-F0-9-]\{36\}')
+          if [ -z "$UDID" ]; then
+            UDID=$(xcrun simctl list devices available | grep "iPhone" | head -1 | grep -o '[A-F0-9-]\{36\}')
+          fi
+          echo "Booting simulator $UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl install booted "${{ env.APP_PATH }}"
+          echo "SIMULATOR_UDID=$UDID" >> $GITHUB_ENV
+
+      - name: Run Maestro tests
+        run: |
+          $HOME/.maestro/bin/maestro test flows/ --format JUNIT --output /tmp/results.xml || true
 
       - name: POST results to ai-tester
         if: always()
@@ -86,26 +95,25 @@ jobs:
 
             const results = flows.map(flow => {
               const name = 'flow_' + flow.id;
-              const hasTestcase = xml.includes('name=\"' + name + '\"');
-              const hasFailed = hasTestcase && new RegExp(
-                '<testcase[^>]+name=\"' + name + '\"[\\s\\S]*?<failure'
-              ).test(xml);
-              const timeMatch = xml.match(
-                new RegExp('<testcase[^>]+name=\"' + name + '\"[^>]+time=\"([^\"]+)\"')
-              );
+              const tcMatch = xml.match(new RegExp('<testcase[^>]+name=\"' + name + '\"[^>]*>([\\s\\S]*?)<\\/testcase>|<testcase[^>]+name=\"' + name + '\"[^>]*\\/>'));
+              if (!tcMatch) {
+                return { flowId: parseInt(flow.id), status: 'failed', durationMs: null, failedStep: 'Flow did not run' };
+              }
+              const tcTag = tcMatch[0];
+              const timeMatch = tcTag.match(/time=\"([^\"]+)\"/);
+              const failureMatch = tcTag.match(/<failure[^>]*message=\"([^\"]*)\"/);
+              const hasFailed = /<failure/.test(tcTag);
               return {
                 flowId: parseInt(flow.id),
-                status: !hasTestcase ? 'failed' : hasFailed ? 'failed' : 'passed',
+                status: hasFailed ? 'failed' : 'passed',
                 durationMs: timeMatch ? Math.round(parseFloat(timeMatch[1]) * 1000) : null,
-                failedStep: null,
+                failedStep: failureMatch ? failureMatch[1] : null,
               };
             });
 
-            const body = JSON.stringify({
-              runId: parseInt(process.env.RUN_ID),
-              flows: results
-            });
+            console.log('Results:', JSON.stringify(results, null, 2));
 
+            const body = JSON.stringify({ runId: parseInt(process.env.RUN_ID), flows: results });
             fetch(process.env.CALLBACK_URL, {
               method: 'POST',
               headers: {
