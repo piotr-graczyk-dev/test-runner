@@ -1,0 +1,115 @@
+name: Maestro Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ai-tester run ID"
+        required: true
+      artifact_url:
+        description: "EAS APK artifact URL"
+        required: true
+      flows_json:
+        description: "Base64-encoded JSON array of {id, yaml}"
+        required: true
+      callback_url:
+        description: "URL to POST results to"
+        required: true
+
+jobs:
+  maestro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Maestro
+        run: |
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> $GITHUB_PATH
+
+      - name: Prepare flows and download APK
+        env:
+          FLOWS_JSON: ${{ inputs.flows_json }}
+          ARTIFACT_URL: ${{ inputs.artifact_url }}
+        run: |
+          mkdir -p flows
+          echo "$FLOWS_JSON" | base64 -d > /tmp/flows.json
+          node -e "
+            const flows = JSON.parse(require('fs').readFileSync('/tmp/flows.json', 'utf8'));
+            flows.forEach(f => {
+              require('fs').writeFileSync('flows/flow_' + f.id + '.yaml', f.yaml);
+              console.log('Wrote flow', f.id);
+            });
+          "
+          wget -q -O app.apk "$ARTIFACT_URL"
+          echo "APK downloaded: $(du -sh app.apk)"
+
+      - name: Run Maestro on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          profile: pixel_5
+          script: |
+            $HOME/.maestro/bin/maestro test flows/ --format JUNIT --output /tmp/results.xml || true
+
+      - name: POST results to ai-tester
+        if: always()
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_SECRET: ${{ secrets.TEST_RESULTS_SECRET }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const flows = JSON.parse(fs.readFileSync('/tmp/flows.json', 'utf8'));
+
+            let xml = '';
+            try { xml = fs.readFileSync('/tmp/results.xml', 'utf8'); } catch {}
+
+            const results = flows.map(flow => {
+              const name = 'flow_' + flow.id;
+              const hasTestcase = xml.includes('name=\"' + name + '\"');
+              const hasFailed = hasTestcase && new RegExp(
+                '<testcase[^>]+name=\"' + name + '\"[\\s\\S]*?<failure'
+              ).test(xml);
+              const timeMatch = xml.match(
+                new RegExp('<testcase[^>]+name=\"' + name + '\"[^>]+time=\"([^\"]+)\"')
+              );
+              return {
+                flowId: parseInt(flow.id),
+                status: !hasTestcase ? 'failed' : hasFailed ? 'failed' : 'passed',
+                durationMs: timeMatch ? Math.round(parseFloat(timeMatch[1]) * 1000) : null,
+                failedStep: null,
+              };
+            });
+
+            const body = JSON.stringify({
+              runId: parseInt(process.env.RUN_ID),
+              flows: results
+            });
+
+            fetch(process.env.CALLBACK_URL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + process.env.CALLBACK_SECRET,
+              },
+              body,
+            }).then(r => {
+              console.log('Callback status:', r.status);
+              if (!r.ok) return r.text().then(t => { throw new Error(t); });
+            }).catch(e => {
+              console.error('Callback failed:', e.message);
+              process.exit(1);
+            });
+          "
