@@ -50,8 +50,16 @@ jobs:
               console.log('Wrote flow', f.id);
             });
           "
-          wget -q -O app.apk "$ARTIFACT_URL"
-          echo "APK downloaded: $(du -sh app.apk)"
+          wget -q -O artifact "$ARTIFACT_URL"
+          # EAS artifacts may be a tar.gz containing the APK — extract if needed
+          if file artifact | grep -q "gzip"; then
+            tar -xzf artifact
+            APK=$(find . -name "*.apk" | head -1)
+            mv "$APK" app.apk
+          else
+            mv artifact app.apk
+          fi
+          echo "APK ready: $(du -sh app.apk)"
 
       - name: Run Maestro on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
